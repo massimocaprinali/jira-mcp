@@ -319,6 +319,7 @@ export class JiraApiService {
         "subtasks",
         "customfield_10014",
         "issuelinks",
+        "labels",
       ].join(","),
       expand: "names,renderedFields",
     });
@@ -347,6 +348,7 @@ export class JiraApiService {
         "subtasks",
         "customfield_10014",
         "issuelinks",
+        "labels",
       ].join(","),
       expand: "names,renderedFields",
     });
@@ -393,6 +395,7 @@ export class JiraApiService {
         "subtasks",
         "customfield_10014",
         "issuelinks",
+        "labels",
         "attachment",
       ].join(","),
       expand: "names,renderedFields",
