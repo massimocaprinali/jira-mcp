@@ -1,10 +1,13 @@
 import {
   AddCommentResponse,
   AdfDoc,
+  CleanAttachment,
   CleanComment,
   CleanJiraIssue,
   JiraCommentResponse,
   SearchIssuesResponse,
+  TM4JTestCase,
+  TM4JTestRun,
 } from "../types/jira.js";
 
 export class JiraApiService {
@@ -37,30 +40,51 @@ export class JiraApiService {
   ): Promise<never> {
     if (!response.ok) {
       let message = response.statusText;
-      let errorData = {};
+      let errorData: any = {};
       try {
         errorData = await response.json();
 
+        // Try different error formats that Jira uses
         if (
-          Array.isArray((errorData as any).errorMessages) &&
-          (errorData as any).errorMessages.length > 0
+          Array.isArray(errorData.errorMessages) &&
+          errorData.errorMessages.length > 0
         ) {
-          message = (errorData as any).errorMessages.join("; ");
-        } else if ((errorData as any).message) {
-          message = (errorData as any).message;
-        } else if ((errorData as any).errorMessage) {
-          message = (errorData as any).errorMessage;
+          // Format: { errorMessages: ["msg1", "msg2"] }
+          message = errorData.errorMessages.join("; ");
+        } else if (errorData.message) {
+          // Format: { message: "error message" }
+          message = errorData.message;
+        } else if (errorData.errorMessage) {
+          // Format: { errorMessage: "error message" }
+          message = errorData.errorMessage;
+        } else if (errorData.errors && typeof errorData.errors === "object") {
+          // Format: { errors: { fieldName: "error for field", anotherField: "another error" } }
+          const errorMessages = Object.entries(errorData.errors)
+            .map(([field, msg]) => `${field}: ${msg}`)
+            .join("; ");
+          if (errorMessages) {
+            message = errorMessages;
+          }
+        }
+
+        // If we still only have statusText but have error data, stringify it
+        if (message === response.statusText && Object.keys(errorData).length > 0) {
+          message = JSON.stringify(errorData);
         }
       } catch (e) {
-        console.warn("Could not parse JIRA error response body as JSON.");
+        // Could not parse as JSON, try to get text
+        try {
+          const text = await response.text();
+          if (text) {
+            message = text.substring(0, 500); // Limit length
+          }
+        } catch {
+          // Ignore
+        }
       }
 
-      const details = JSON.stringify(errorData, null, 2);
-      console.error("JIRA API Error Details:", details);
-
-      const errorMessage = message ? `: ${message}` : "";
       throw new Error(
-        `JIRA API Error${errorMessage} (Status: ${response.status})`
+        `JIRA API Error: ${message} (Status: ${response.status})`
       );
     }
 
@@ -140,6 +164,19 @@ export class JiraApiService {
     };
   }
 
+  protected cleanAttachment(attachment: any): CleanAttachment {
+    return {
+      id: attachment.id,
+      filename: attachment.filename,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+      created: attachment.created,
+      author: attachment.author?.displayName,
+      content: attachment.content,
+      thumbnail: attachment.thumbnail,
+    };
+  }
+
   /**
    * Recursively extracts text content from Atlassian Document Format nodes
    */
@@ -160,9 +197,16 @@ export class JiraApiService {
   }
 
   protected cleanIssue(issue: any): CleanJiraIssue {
-    const description = issue.fields?.description?.content
-      ? this.extractTextContent(issue.fields.description.content)
-      : "";
+    let description = "";
+    if (issue.fields?.description) {
+      if (typeof issue.fields.description === "string") {
+        // Jira Server: plain text
+        description = issue.fields.description;
+      } else if (issue.fields.description.content) {
+        // Jira Cloud: ADF format
+        description = this.extractTextContent(issue.fields.description.content);
+      }
+    }
 
     const cleanedIssue: CleanJiraIssue = {
       id: issue.id,
@@ -228,6 +272,16 @@ export class JiraApiService {
       }));
     }
 
+    if (issue.fields?.labels?.length > 0) {
+      cleanedIssue.labels = issue.fields.labels;
+    }
+
+    if (issue.fields?.attachment?.length > 0) {
+      cleanedIssue.attachments = issue.fields.attachment.map((a: any) =>
+        this.cleanAttachment(a)
+      );
+    }
+
     return cleanedIssue;
   }
 
@@ -239,6 +293,11 @@ export class JiraApiService {
 
     if (!response.ok) {
       await this.handleFetchError(response, url);
+    }
+
+    // Handle 204 No Content - return undefined for void operations (transitions, updates)
+    if (response.status === 204 || response.headers.get('content-length') === '0') {
+      return undefined as T;
     }
 
     return response.json();
@@ -334,6 +393,7 @@ export class JiraApiService {
         "subtasks",
         "customfield_10014",
         "issuelinks",
+        "attachment",
       ].join(","),
       expand: "names,renderedFields",
     });
@@ -405,6 +465,86 @@ export class JiraApiService {
     });
   }
 
+  async getCreateMeta(
+    projectKey: string,
+    issueTypeName?: string,
+    compact?: boolean
+  ): Promise<any> {
+    // Get available issue types for the project
+    const issueTypesData = await this.fetchJson<{ issueTypes: Array<{ id: string; name: string; description?: string; subtask: boolean }> }>(
+      `/rest/api/3/issue/createmeta/${projectKey}/issuetypes`
+    );
+
+    let issueTypes = issueTypesData.issueTypes || [];
+
+    // Filter by issue type name if provided
+    if (issueTypeName) {
+      issueTypes = issueTypes.filter(
+        (it) => it.name.toLowerCase() === issueTypeName.toLowerCase()
+      );
+    }
+
+    // Get fields for each issue type
+    const result = {
+      projectKey,
+      issueTypes: await Promise.all(
+        issueTypes.map(async (issueType) => {
+          try {
+            const fieldsData = await this.fetchJson<{ fields: Array<{ fieldId: string; name: string; required: boolean; schema?: any; allowedValues?: any[]; hasDefaultValue?: boolean }> }>(
+              `/rest/api/3/issue/createmeta/${projectKey}/issuetypes/${issueType.id}`
+            );
+
+            let fields = fieldsData.fields || [];
+
+            // In compact mode, replace allowedValues with count
+            if (compact) {
+              fields = fields.map((f) => ({
+                fieldId: f.fieldId,
+                name: f.name,
+                required: f.required,
+                schema: f.schema,
+                hasDefaultValue: f.hasDefaultValue,
+                allowedValuesCount: f.allowedValues?.length ?? 0,
+              }));
+            }
+
+            return {
+              id: issueType.id,
+              name: issueType.name,
+              description: issueType.description,
+              subtask: issueType.subtask,
+              fields,
+            };
+          } catch (error) {
+            return {
+              id: issueType.id,
+              name: issueType.name,
+              description: issueType.description,
+              subtask: issueType.subtask,
+              fields: [],
+              error: error instanceof Error ? error.message : "Failed to fetch fields",
+            };
+          }
+        })
+      ),
+    };
+
+    return result;
+  }
+
+  async getFieldOptions(
+    projectKey: string,
+    issueTypeId: string,
+    fieldId: string
+  ): Promise<any[]> {
+    const fieldsData = await this.fetchJson<{ fields: Array<{ fieldId: string; allowedValues?: any[] }> }>(
+      `/rest/api/3/issue/createmeta/${projectKey}/issuetypes/${issueTypeId}`
+    );
+
+    const field = (fieldsData.fields || []).find((f) => f.fieldId === fieldId);
+    return field?.allowedValues ?? [];
+  }
+
   async updateIssue(
     issueKey: string,
     fields: Record<string, any>
@@ -471,7 +611,7 @@ export class JiraApiService {
     filename: string
   ): Promise<{ id: string; filename: string }> {
     const formData = new FormData();
-    formData.append("file", new Blob([file]), filename);
+    formData.append("file", new Blob([new Uint8Array(file)]), filename);
 
     const headers = new Headers(this.headers);
     headers.delete("Content-Type");
@@ -548,5 +688,125 @@ export class JiraApiService {
       updated: response.updated,
       body: this.extractTextContent(response.body.content),
     };
+  }
+
+  async getServerInfo(): Promise<{
+    version: string;
+    versionNumbers: number[];
+    deploymentType: string;
+    buildNumber: number;
+    serverTitle: string;
+  }> {
+    return this.fetchJson(`/rest/api/3/serverInfo`);
+  }
+
+  async getProjects(): Promise<Array<{
+    id: string;
+    key: string;
+    name: string;
+    projectTypeKey: string;
+    lead?: { displayName: string; accountId?: string };
+  }>> {
+    const data = await this.fetchJson<any[]>(`/rest/api/3/project`);
+    return data.map((project) => ({
+      id: project.id,
+      key: project.key,
+      name: project.name,
+      projectTypeKey: project.projectTypeKey,
+      lead: project.lead ? {
+        displayName: project.lead.displayName,
+        accountId: project.lead.accountId,
+      } : undefined,
+    }));
+  }
+
+  async getUsers(query: string, maxResults: number = 50): Promise<Array<{
+    accountId: string;
+    displayName: string;
+    emailAddress?: string;
+    active: boolean;
+  }>> {
+    const params = new URLSearchParams({
+      query,
+      maxResults: maxResults.toString(),
+    });
+    const data = await this.fetchJson<any[]>(`/rest/api/3/user/search?${params}`);
+    return data.map((user) => ({
+      accountId: user.accountId,
+      displayName: user.displayName,
+      emailAddress: user.emailAddress,
+      active: user.active,
+    }));
+  }
+
+  async deleteIssue(issueKey: string): Promise<void> {
+    const response = await fetch(`${this.baseUrl}/rest/api/3/issue/${issueKey}`, {
+      method: "DELETE",
+      headers: this.headers,
+    });
+
+    if (!response.ok) {
+      await this.handleFetchError(response);
+    }
+  }
+
+  async getAttachment(attachmentId: string): Promise<{
+    content: string; // base64 encoded
+    filename: string;
+    mimeType: string;
+  }> {
+    // First, get attachment metadata to get the content URL
+    const metadata = await this.fetchJson<{
+      id: string;
+      filename: string;
+      mimeType: string;
+      content: string;
+    }>(`/rest/api/3/attachment/${attachmentId}`);
+
+    // Fetch the actual content from the content URL
+    const response = await fetch(metadata.content, {
+      headers: this.headers,
+    });
+
+    if (!response.ok) {
+      await this.handleFetchError(response);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const base64 = Buffer.from(arrayBuffer).toString("base64");
+
+    return {
+      content: base64,
+      filename: metadata.filename,
+      mimeType: metadata.mimeType,
+    };
+  }
+
+  // ============================================================================
+  // TM4J / Zephyr Scale API Methods
+  // ============================================================================
+
+  protected tm4jBasePath = '/rest/atm/1.0';
+
+  async getTestCase(testCaseKey: string): Promise<TM4JTestCase> {
+    return this.fetchJson<TM4JTestCase>(`${this.tm4jBasePath}/testcase/${testCaseKey}`);
+  }
+
+  async searchTestCases(query: string, maxResults = 50): Promise<TM4JTestCase[]> {
+    const encodedQuery = encodeURIComponent(query);
+    return this.fetchJson<TM4JTestCase[]>(
+      `${this.tm4jBasePath}/testcase/search?query=${encodedQuery}&maxResults=${maxResults}`
+    );
+  }
+
+  async getTestRun(testRunKey: string): Promise<TM4JTestRun> {
+    return this.fetchJson<TM4JTestRun>(`${this.tm4jBasePath}/testrun/${testRunKey}`);
+  }
+
+  async searchTestRuns(query: string, maxResults = 50): Promise<TM4JTestRun[]> {
+    const encodedQuery = encodeURIComponent(query);
+    return this.fetchJson<TM4JTestRun[]>(
+      `${this.tm4jBasePath}/testrun/search?query=${encodedQuery}&maxResults=${maxResults}`
+    );
   }
 }
