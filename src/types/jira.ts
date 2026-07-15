@@ -15,6 +15,8 @@ export interface CleanJiraIssue {
   created: string | undefined;
   updated: string | undefined;
   description: string;
+  labels?: string[];
+  attachments?: CleanAttachment[];
   comments?: CleanComment[];
   parent?: {
     id: string;
@@ -82,4 +84,41 @@ export interface AddCommentResponse {
   created: string;
   updated: string;
   body: string; // Return plain text for simplicity
+}
+
+export interface CleanAttachment {
+  id: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+  created: string;
+  author?: string;
+  content: string;
+  thumbnail?: string;
+}
+
+export interface TM4JTestCase {
+  key: string;
+  name: string;
+  status?: string;
+  priority?: string;
+  objective?: string;
+  precondition?: string;
+  estimatedTime?: number;
+  labels?: string[];
+  folder?: string;
+  projectKey?: string;
+  [key: string]: any;
+}
+
+export interface TM4JTestRun {
+  key: string;
+  name: string;
+  status?: string;
+  projectKey?: string;
+  testCases?: Array<{
+    testCaseKey: string;
+    status?: string;
+  }>;
+  [key: string]: any;
 }
